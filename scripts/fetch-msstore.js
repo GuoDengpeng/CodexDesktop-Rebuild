@@ -166,7 +166,37 @@ function makeGetUrlSoap(updateID, revisionNumber, ring) {
 
 // ─── HTTP 辅助 ───────────────────────────────────────────────────
 
-function httpsRequest(url, options = {}) {
+const REQUEST_TIMEOUT_MS = 60000;
+const REQUEST_MAX_ATTEMPTS = 3;
+const REQUEST_RETRY_DELAY_MS = 2000;
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function withRetry(operation, options = {}) {
+  const maxAttempts = options.maxAttempts || REQUEST_MAX_ATTEMPTS;
+  const retryDelayMs = options.retryDelayMs ?? REQUEST_RETRY_DELAY_MS;
+  let lastError;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await operation();
+    } catch (error) {
+      lastError = error;
+      if (attempt === maxAttempts) break;
+
+      console.warn(
+        `  [重试 ${attempt}/${maxAttempts - 1}] 请求失败: ${error.message}`
+      );
+      if (retryDelayMs > 0) await delay(retryDelayMs * attempt);
+    }
+  }
+
+  throw lastError;
+}
+
+function httpsRequestOnce(url, options = {}) {
   return new Promise((resolve, reject) => {
     const urlObj = new URL(url);
     const reqOpts = {
@@ -186,13 +216,23 @@ function httpsRequest(url, options = {}) {
     });
 
     req.on("error", reject);
-    req.setTimeout(30000, () => {
-      req.destroy(new Error("Request timeout"));
+    req.setTimeout(options.timeoutMs || REQUEST_TIMEOUT_MS, () => {
+      req.destroy(new Error(`Request timeout after ${options.timeoutMs || REQUEST_TIMEOUT_MS} ms`));
     });
 
     if (options.body) req.write(options.body);
     req.end();
   });
+}
+
+function httpsRequest(url, options = {}) {
+  return withRetry(
+    () => httpsRequestOnce(url, options),
+    {
+      maxAttempts: options.maxAttempts,
+      retryDelayMs: options.retryDelayMs,
+    }
+  );
 }
 
 function soapPost(url, body) {
@@ -614,7 +654,7 @@ async function main() {
 }
 
 // 支持作为模块导入
-module.exports = { getCookie, getAppInfo, getFileList, getDownloadUrl };
+module.exports = { getCookie, getAppInfo, getFileList, getDownloadUrl, withRetry };
 
 // CLI 直接运行
 if (require.main === module) {

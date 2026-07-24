@@ -180,6 +180,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
+      - name: Free disk space
+        run: |
+          echo "Disk space before cleanup:"
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          sudo apt-get clean
+          echo "Disk space after cleanup:"
+          df -h /
+
       - name: Setup Node.js
         uses: actions/setup-node@v6
         with:
