@@ -10,6 +10,7 @@
  *   node scripts/check-update.js --force      # 强制输出（即使无更新）
  *   node scripts/check-update.js --json       # JSON 输出
  *   node scripts/check-update.js --save       # 更新本地版本记录
+ *   node scripts/check-update.js --state-file <path> # 使用指定版本记录
  */
 
 const https = require("https");
@@ -31,7 +32,7 @@ https.globalAgent.options.ca = extraCAs;
 const APPCAST_ARM64 = "https://persistent.oaistatic.com/codex-app-prod/appcast.xml";
 const APPCAST_X64 = "https://persistent.oaistatic.com/codex-app-prod/appcast-x64.xml";
 const MS_STORE_PRODUCT_ID = "9plm9xgg6vks";
-const VERSION_FILE = path.join(__dirname, ".versions.json");
+const DEFAULT_VERSION_FILE = path.join(__dirname, ".versions.json");
 
 // ─── HTTP 辅助 ───────────────────────────────────────────────────
 function httpsGet(url) {
@@ -114,7 +115,8 @@ async function checkWindowsVersion() {
   }
 
   // 从包名提取版本: OpenAI.Codex_26.325.2171.0_x64__xxx.msix
-  const pkg = packages[0];
+  const { selectWindowsPackage } = require("./sync-upstream");
+  const pkg = selectWindowsPackage(packages);
   const versionMatch = pkg.name.match(/_(\d+\.\d+\.\d+(?:\.\d+)?)_/);
   const version = versionMatch ? versionMatch[1] : "unknown";
 
@@ -138,16 +140,37 @@ async function checkWindowsVersion() {
 }
 
 // ─── 版本记录读写 ────────────────────────────────────────────────
-function loadVersions() {
+function loadVersions(versionFile = DEFAULT_VERSION_FILE) {
   try {
-    return JSON.parse(fs.readFileSync(VERSION_FILE, "utf-8"));
+    return JSON.parse(fs.readFileSync(versionFile, "utf-8"));
   } catch {
     return {};
   }
 }
 
-function saveVersions(versions) {
-  fs.writeFileSync(VERSION_FILE, JSON.stringify(versions, null, 2) + "\n");
+function saveVersions(versions, versionFile = DEFAULT_VERSION_FILE) {
+  fs.mkdirSync(path.dirname(versionFile), { recursive: true });
+  fs.writeFileSync(versionFile, JSON.stringify(versions, null, 2) + "\n");
+}
+
+function resolveVersionFile(args) {
+  const index = args.indexOf("--state-file");
+  if (index === -1) return DEFAULT_VERSION_FILE;
+
+  const value = args[index + 1];
+  if (!value || value.startsWith("--")) {
+    throw new Error("--state-file 需要提供文件路径");
+  }
+  return path.resolve(process.cwd(), value);
+}
+
+function findUpdates(results, saved) {
+  return results.filter((info) => {
+    const previous = saved[info.platform];
+    return !previous ||
+      previous.version !== info.version ||
+      String(previous.build || "") !== String(info.build || "");
+  });
 }
 
 function formatSize(bytes) {
@@ -165,10 +188,10 @@ async function main() {
   const jsonOutput = args.includes("--json");
   const doSave = args.includes("--save");
   const quiet = jsonOutput || args.includes("--quiet") || args.includes("-q");
+  const versionFile = resolveVersionFile(args);
 
-  const saved = loadVersions();
+  const saved = loadVersions(versionFile);
   const results = [];
-  const updates = [];
 
   const checks = await Promise.allSettled([
     checkMacArm64Version(),
@@ -180,13 +203,12 @@ async function main() {
     if (r.status === "fulfilled") {
       const info = r.value;
       results.push(info);
-      const key = info.platform;
-      const isNew = !saved[key] || saved[key].version !== info.version || saved[key].build !== info.build;
-      if (isNew) updates.push(info);
     } else if (!quiet) {
       console.error(`  [!] ${r.reason.message}`);
     }
   }
+
+  const updates = findUpdates(results, saved);
 
   // JSON 输出模式
   if (jsonOutput) {
@@ -235,8 +257,8 @@ async function main() {
         checkedAt: new Date().toISOString(),
       };
     }
-    saveVersions(newSaved);
-    if (!quiet) console.log(`💾 版本记录已保存到 ${VERSION_FILE}`);
+    saveVersions(newSaved, versionFile);
+    if (!quiet) console.log(`💾 版本记录已保存到 ${versionFile}`);
   }
 
   // 退出码: 0=有更新, 1=无更新（方便 CI 使用）
@@ -245,7 +267,13 @@ async function main() {
   return { results, updates };
 }
 
-module.exports = { checkMacArm64Version, checkMacX64Version, checkWindowsVersion };
+module.exports = {
+  checkMacArm64Version,
+  checkMacX64Version,
+  checkWindowsVersion,
+  findUpdates,
+  resolveVersionFile,
+};
 
 if (require.main === module) {
   main().catch((e) => {

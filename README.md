@@ -55,7 +55,7 @@ npm run dev
 
 GitHub Actions automatically builds on:
 - Push to `master` / `main` and tag `v*` → build artifacts
-- Daily upstream sync workflow → downloads upstream, reapplies patches, builds, and creates a draft release when a newer upstream version is detected
+- 每日上游同步工作流：逐平台比较已保存的版本；仅在任一平台版本变化时下载上游、重新应用补丁、构建并更新 Release
 
 ## Credits
 
