@@ -14,6 +14,7 @@ const path = require("path");
 
 const PATCHES = [
   "patch-i18n.js",
+  "patch-reasoning-effort-labels.js",
   "patch-copyright.js",
   "patch-devtools.js",
   "patch-fast-mode.js",
