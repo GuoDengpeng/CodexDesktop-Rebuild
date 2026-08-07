@@ -1,8 +1,8 @@
 /**
  * Post-build patch: Update copyright text
  *
- * Uses AST to locate `setAboutPanelOptions({ copyright: "(c) OpenAI" })`
- * and replace the copyright string with a custom value.
+ * 兼容两种上游实现：旧版 setAboutPanelOptions 的 copyright 属性，以及
+ * 26.803 起自定义 About HTML 中的 copyright 节点。
  *
  * Usage:
  *   node scripts/patch-copyright.js [platform]   # Apply patch (unix/win/omit=both)
@@ -19,6 +19,8 @@ const { locateBundles, relPath } = require("./patch-util");
 
 const OLD_COPYRIGHT = "\u00A9 OpenAI"; // (c) OpenAI
 const NEW_COPYRIGHT = "\u00A9 OpenAI \u00B7 Cometix Space"; // (c) OpenAI . Cometix Space
+const OLD_COPYRIGHT_HTML = `<div class="copyright">${OLD_COPYRIGHT}</div>`;
+const NEW_COPYRIGHT_HTML = `<div class="copyright">${NEW_COPYRIGHT}</div>`;
 
 // ──────────────────────────────────────────────
 //  AST walker
@@ -84,6 +86,19 @@ function collectPatches(ast, source) {
       return;
     }
   });
+
+  // 26.803 起 About 面板改成自定义 HTML，不再调用 setAboutPanelOptions。
+  let offset = 0;
+  while ((offset = source.indexOf(OLD_COPYRIGHT_HTML, offset)) !== -1) {
+    patches.push({
+      start: offset,
+      end: offset + OLD_COPYRIGHT_HTML.length,
+      replacement: NEW_COPYRIGHT_HTML,
+      original: OLD_COPYRIGHT_HTML,
+    });
+    offset += OLD_COPYRIGHT_HTML.length;
+  }
+
   return patches;
 }
 
@@ -148,4 +163,12 @@ function main() {
   }
 }
 
-main();
+if (require.main === module) main();
+
+module.exports = {
+  NEW_COPYRIGHT,
+  NEW_COPYRIGHT_HTML,
+  OLD_COPYRIGHT,
+  OLD_COPYRIGHT_HTML,
+  collectPatches,
+};

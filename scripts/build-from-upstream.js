@@ -98,6 +98,13 @@ function clearExistingAsarUnpacked(asarPath) {
   }
 }
 
+function isOwlRuntime(appDir) {
+  return (
+    fs.existsSync(path.join(appDir, "owl-shell-runtime.json")) &&
+    fs.existsSync(path.join(appDir, "resources", "owl-electron-app.json"))
+  );
+}
+
 function asarCliPath() {
   return path.join(PROJECT_ROOT, "node_modules", "@electron", "asar", "bin", "asar.mjs");
 }
@@ -296,12 +303,17 @@ function buildWin(platform) {
   console.log(`   [integrity] new hash: ${newHash.slice(0, 16)}...`);
 
   if (oldHash !== newHash) {
-    // Find Codex.exe in app root
-    const exePath = path.join(outApp, "Codex.exe");
-    if (fs.existsSync(exePath)) {
-      patchExeHash(exePath, oldHash, newHash);
+    if (isOwlRuntime(outApp)) {
+      // Owl runtime 不在可执行文件中嵌入 Electron ASAR 头哈希。
+      console.log("   [integrity] Owl runtime has no embedded ASAR header hash");
     } else {
-      console.log("   [!] Codex.exe not found for hash patching");
+      // 旧 Electron Windows 包把 ASAR 头哈希嵌入 Codex.exe。
+      const exePath = path.join(outApp, "Codex.exe");
+      if (fs.existsSync(exePath)) {
+        patchExeHash(exePath, oldHash, newHash);
+      } else {
+        console.log("   [!] Codex.exe not found for hash patching");
+      }
     }
   }
 
@@ -460,4 +472,6 @@ function main() {
   }
 }
 
-main();
+if (require.main === module) main();
+
+module.exports = { computeAsarHeaderHash, isOwlRuntime, patchExeHash };

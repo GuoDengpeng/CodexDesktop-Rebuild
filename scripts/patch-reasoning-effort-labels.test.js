@@ -16,7 +16,7 @@ function createLocaleSource(overrides = {}) {
 
 test("为全部推理强度补充实际参数并说明 Ultra", () => {
   const source = createLocaleSource({
-    "composer.mode.local.reasoning.low.label": "轻度",
+    "composer.mode.local.reasoning.low.label.v2": "轻度",
     "composer.mode.local.reasoning.ultra.label": "极高",
     "composer.modelPicker.power.ultraUsageWarning": "更快消耗使用额度",
   });
@@ -27,6 +27,23 @@ test("为全部推理强度补充实际参数并说明 Ultra", () => {
   for (const [messageId, translation] of Object.entries(TRANSLATIONS)) {
     assert.match(result.source, new RegExp(`"${messageId.replaceAll(".", "\\.")}":\`${translation}\``));
   }
+});
+
+test("兼容旧版 low 消息 ID", () => {
+  const source = createLocaleSource({
+    "composer.mode.local.reasoning.low.label.v2": "轻度",
+  }).replace(
+    "composer.mode.local.reasoning.low.label.v2",
+    "composer.mode.local.reasoning.low.label",
+  );
+
+  const result = patchSource(source);
+
+  assert.equal(result.status, "patched");
+  assert.match(
+    result.source,
+    /"composer\.mode\.local\.reasoning\.low\.label":`轻度（low）`/,
+  );
 });
 
 test("重复执行不会再次修改语言包", () => {

@@ -16,18 +16,33 @@ const { SRC_DIR, relPath } = require("./patch-util");
 
 const PLATFORMS = ["mac-arm64", "mac-x64", "win"];
 
-const TRANSLATIONS = Object.freeze({
-  "composer.mode.local.reasoning.none.label": "无（none）",
-  "composer.mode.local.reasoning.minimal.label": "极低（minimal）",
-  "composer.mode.local.reasoning.low.label": "轻度（low）",
-  "composer.mode.local.reasoning.medium.label": "中（medium）",
-  "composer.mode.local.reasoning.high.label": "高（high）",
-  "composer.mode.local.reasoning.xhigh.label": "极高（xhigh）",
-  "composer.mode.local.reasoning.max.label": "最高（max）",
-  "composer.mode.local.reasoning.ultra.label": "Ultra（ultra）",
-  "composer.modelPicker.power.ultraUsageWarning":
-    "自动任务委派，更快消耗使用额度",
-});
+const TRANSLATION_SPECS = Object.freeze([
+  { messageIds: ["composer.mode.local.reasoning.none.label"], translation: "无（none）" },
+  { messageIds: ["composer.mode.local.reasoning.minimal.label"], translation: "极低（minimal）" },
+  {
+    // 26.803 将 low 的消息 ID 升级为 v2；保留旧 ID 以兼容历史安装包。
+    messageIds: [
+      "composer.mode.local.reasoning.low.label.v2",
+      "composer.mode.local.reasoning.low.label",
+    ],
+    translation: "轻度（low）",
+  },
+  { messageIds: ["composer.mode.local.reasoning.medium.label"], translation: "中（medium）" },
+  { messageIds: ["composer.mode.local.reasoning.high.label"], translation: "高（high）" },
+  { messageIds: ["composer.mode.local.reasoning.xhigh.label"], translation: "极高（xhigh）" },
+  { messageIds: ["composer.mode.local.reasoning.max.label"], translation: "最高（max）" },
+  { messageIds: ["composer.mode.local.reasoning.ultra.label"], translation: "Ultra（ultra）" },
+  {
+    messageIds: ["composer.modelPicker.power.ultraUsageWarning"],
+    translation: "自动任务委派，更快消耗使用额度",
+  },
+]);
+
+const TRANSLATIONS = Object.freeze(
+  Object.fromEntries(
+    TRANSLATION_SPECS.map(({ messageIds, translation }) => [messageIds[0], translation]),
+  ),
+);
 
 function escapeTemplateLiteral(value) {
   return value
@@ -63,15 +78,18 @@ function patchSource(source) {
   const patches = [];
   const invalidEntries = [];
 
-  for (const [messageId, translation] of Object.entries(TRANSLATIONS)) {
-    const marker = `"${messageId}":\``;
-    const occurrences = findOccurrences(source, marker);
-    if (occurrences.length !== 1) {
-      invalidEntries.push({ messageId, count: occurrences.length });
+  for (const { messageIds, translation } of TRANSLATION_SPECS) {
+    const candidates = messageIds.flatMap((messageId) => {
+      const marker = `"${messageId}":\``;
+      return findOccurrences(source, marker).map((offset) => ({ messageId, marker, offset }));
+    });
+    if (candidates.length !== 1) {
+      invalidEntries.push({ messageId: messageIds.join(" or "), count: candidates.length });
       continue;
     }
 
-    const start = occurrences[0] + marker.length;
+    const [{ messageId, marker, offset }] = candidates;
+    const start = offset + marker.length;
     const end = findTemplateLiteralEnd(source, start);
     if (end === -1) {
       invalidEntries.push({ messageId, count: 0, unterminated: true });
@@ -218,4 +236,4 @@ function main() {
 
 if (require.main === module) main();
 
-module.exports = { TRANSLATIONS, findTargets, patchSource };
+module.exports = { TRANSLATIONS, TRANSLATION_SPECS, findTargets, patchSource };

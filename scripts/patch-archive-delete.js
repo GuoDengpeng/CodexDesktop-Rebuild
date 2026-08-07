@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * patch-archive-delete.js — Add "Delete" button to archived conversations list.
+ * patch-archive-delete.js — 为旧版归档会话列表补充删除能力。
  *
  * Two-layer patch:
  *   1. app-main chunk: inject "delete-conversation" route into the message router
@@ -10,10 +10,21 @@
  * message router, which permanently removes the thread (DB + rollout file).
  *
  * Requires @cometix/codex CLI with thread/delete support.
+ * 26.803 起上游已提供单条、按项目及全部删除；检测到完整原生链路时不再注入。
  */
 const fs = require("fs");
 const acorn = require("acorn");
 const { locateBundles, relPath } = require("./patch-util");
+
+function hasNativeArchiveDelete(code) {
+  return [
+    "delete-archived-conversation",
+    "delete-all-archived-conversations",
+    "showDeleteButton",
+    "settings.dataControls.archivedChats.deleteConfirm.title",
+    "thread/delete",
+  ].every((marker) => code.includes(marker));
+}
 
 // ─── Layer 1: app-main route injection ──────────────────────────
 
@@ -293,23 +304,42 @@ function main() {
     ["mac-arm64", "mac-x64", "win"].includes(a),
   );
 
+  const dataControlsBundles = locateBundles({
+    dir: "assets",
+    pattern: /^data-controls-.*\.js$/,
+    ...(platform ? { platform } : {}),
+  });
+  const nativeBundles = dataControlsBundles.filter((bundle) =>
+    hasNativeArchiveDelete(fs.readFileSync(bundle.path, "utf-8")),
+  );
+  const nativePlatforms = new Set(nativeBundles.map((bundle) => bundle.platform));
+
+  for (const bundle of nativeBundles) {
+    console.log(`  [ok] ${relPath(bundle.path)}: upstream provides archived conversation deletion`);
+  }
+
   console.log("  [layer 1] app-main: delete-conversation route");
   const appMainBundles = locateBundles({
     dir: "assets",
     pattern: /^app-main-.*\.js$/,
     ...(platform ? { platform } : {}),
   });
-  const routePatched = patchAppMain(appMainBundles, isCheck);
+  const routePatched = patchAppMain(
+    appMainBundles.filter((bundle) => !nativePlatforms.has(bundle.platform)),
+    isCheck,
+  );
 
   console.log("  [layer 2] data-controls: delete button");
-  const dataControlsBundles = locateBundles({
-    dir: "assets",
-    pattern: /^data-controls-.*\.js$/,
-    ...(platform ? { platform } : {}),
-  });
-  const btnPatched = patchDataControls(dataControlsBundles, isCheck);
+  const btnPatched = patchDataControls(
+    dataControlsBundles.filter((bundle) => !nativePlatforms.has(bundle.platform)),
+    isCheck,
+  );
 
-  console.log(`  [done] routes: ${routePatched}, buttons: ${btnPatched}`);
+  console.log(
+    `  [done] native: ${nativeBundles.length}, routes: ${routePatched}, buttons: ${btnPatched}`,
+  );
 }
 
-main();
+if (require.main === module) main();
+
+module.exports = { hasNativeArchiveDelete, patchAppMain, patchDataControls };

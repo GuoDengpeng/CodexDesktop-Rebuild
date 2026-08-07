@@ -10,6 +10,8 @@
  * desktop project picker already updates the active-workspace-roots query, so
  * this patch uses that query as the local-only fallback before falling back to
  * projectless.
+ * 26.803 起上游会把 active-workspace-roots 解析结果写入提交上下文；检测到
+ * 这条完整链路时不再重复注入旧补丁。
  *
  * Usage:
  *   node scripts/patch-composer-workspace-root.js [platform]   # Apply patch
@@ -27,6 +29,17 @@ const OLD_SNIPPET =
 const NEW_SNIPPET =
   "E=async(n,r,i,a)=>{let c=a?.hostId??v,o=a?.workspaceRoots??n.workspaceRoots??(c===`local`?(e.get(Oi)?.data?.roots??[]).filter(e=>e!=null&&e!==`~`):[]);o.length===0&&(o=[`~`]);let s=Ks(o),u=C(a),{context:f,goal:h}=await T(n,c),g=MF(f,c),E=!1,D=Dn(f.imageAttachments),O=e.get(Ok),k=er(f);try{let n=await FF({hostId:c,prompt:k,projectlessPrewarmReservation:_,workspaceRoots:o}),a=n.cwd??r,l=await AF({activeCollaborationMode:t,context:f,hostId:c,scope:e,serviceTier:y}),v=await Cg({context:f,prompt:k,workspaceRoots:n.workspaceRoots,cwd:a,hostId:c,agentMode:u.agentMode,permissionProfileId:u.permissionProfileId,serviceTier:l.serviceTier,collaborationMode:l.collaborationMode,memoryPreferences:O??void 0,workspaceKind:s?`projectless`:`project`,projectlessOutputDirectory:n.projectlessOutputDirectory,projectAssignment:n.projectAssignment})";
 
+function hasNativeWorkspaceRootPropagation(source) {
+  const fallbackHelper =
+    /function\s+[\w$]+\(([\w$]+),([\w$]+)\)\{return\s+\2\?\.workspaceRoots\?\?\1\.workspaceRoots\?\?\[`~`\]\}/;
+  return (
+    source.includes("active-workspace-roots") &&
+    source.includes("localConversationCwd:") &&
+    source.includes("activeWorkspaceRoot:") &&
+    fallbackHelper.test(source)
+  );
+}
+
 function getPlatforms(platform) {
   if (platform) return [platform];
   return ["mac-arm64", "mac-x64", "win"].filter((p) =>
@@ -40,9 +53,13 @@ function findComposerBundles(platform) {
     const assetsDir = path.join(SRC_DIR, plat, "_asar", "webview", "assets");
     if (!fs.existsSync(assetsDir)) continue;
     for (const file of fs.readdirSync(assetsDir)) {
-      if (!/^composer-.*\.js$/.test(file)) continue;
+      if (!/^(?:composer|app-initial)-.*\.js$/.test(file)) continue;
       const filePath = path.join(assetsDir, file);
       const source = fs.readFileSync(filePath, "utf-8");
+      if (hasNativeWorkspaceRootPropagation(source)) {
+        targets.push({ platform: plat, path: filePath, source, native: true });
+        continue;
+      }
       if (
         source.includes("projectlessPrewarmReservation") &&
         source.includes("workspaceRoots") &&
@@ -71,6 +88,10 @@ function main() {
   let patched = 0;
   for (const target of targets) {
     const label = relPath(target.path);
+    if (target.native) {
+      console.log(`  [ok] ${label}: upstream propagates the active workspace root`);
+      continue;
+    }
     if (target.source.includes(PATCHED_MARKER)) {
       console.log(`  [ok] ${label}: already patched`);
       continue;
@@ -101,4 +122,6 @@ function main() {
   }
 }
 
-main();
+if (require.main === module) main();
+
+module.exports = { findComposerBundles, hasNativeWorkspaceRootPropagation };

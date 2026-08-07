@@ -13,7 +13,7 @@
  *   1. maxBreadcrumbs: 20        —— scope 内最多保留 20 条（默认 100）
  *   2. beforeBreadcrumb: <fn>    —— 单条 data 序列化超过 4KB 时替换为占位符
  *
- * 注入点特征（worker.js 与 workspace-root-drop-handler-*.js 各一处）：
+ * 注入点特征（worker.js 与主进程 Sentry chunk 各一处）：
  *   dsn:XX,environment:...
  * 替换为：
  *   dsn:XX,maxBreadcrumbs:20,beforeBreadcrumb:<fn>,environment:...
@@ -43,7 +43,10 @@ const OPTS = "maxBreadcrumbs:20,beforeBreadcrumb:" + TRIM_FN + ",";
 // dsn:<标识符或成员访问>,environment: —— 两处 init 共同的锚点
 const INIT_RE = /dsn:([\w$]+(?:\.[\w$]+)*),environment:/g;
 
-const TARGETS = [/^worker\.js$/, /^workspace-root-drop-handler-.*\.js$/];
+const TARGETS = [
+  /^worker\.js$/,
+  /^(?:workspace-root-drop-handler|window-all-closed)-.*\.js$/,
+];
 
 function patchOne(bundlePath, isCheck) {
   const code = fs.readFileSync(bundlePath, "utf-8");
@@ -81,7 +84,7 @@ function patchOne(bundlePath, isCheck) {
     console.log(
       `  [?] ${relPath(bundlePath)}: would patch ${count} Sentry init site(s)`,
     );
-    return false;
+    return true;
   }
 
   fs.writeFileSync(bundlePath, next);
@@ -117,4 +120,6 @@ function main() {
   console.log(`  [done] ${patched} file(s) patched`);
 }
 
-main();
+if (require.main === module) main();
+
+module.exports = { INIT_RE, MARKER, TARGETS, TRIM_FN, patchOne };

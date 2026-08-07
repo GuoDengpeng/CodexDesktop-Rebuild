@@ -40,22 +40,106 @@ const STALE_LIMITS = [
   "resourceLimits:{maxOldGenerationSizeMb:1536,maxYoungGenerationSizeMb:128}",
 ];
 
-// ensureWorker(){...new X.Worker(i,{name:this.id,workerData:l})...}
-const CTOR_RE =
-  /new ([\w$]+)\.Worker\(([\w$]+),\{name:this\.id,workerData:([\w$]+)\}\)/;
-
-function parseOk(code) {
+function parseCode(code) {
   try {
-    acorn.parse(code, { ecmaVersion: 2022, sourceType: "script" });
-    return true;
+    return acorn.parse(code, { ecmaVersion: 2022, sourceType: "script" });
   } catch {
-    try {
-      acorn.parse(code, { ecmaVersion: 2022, sourceType: "module" });
-      return true;
-    } catch {
-      return false;
-    }
+    return acorn.parse(code, { ecmaVersion: 2022, sourceType: "module" });
   }
+}
+
+function walk(node, visitor) {
+  if (!node || typeof node !== "object") return;
+  visitor(node);
+  for (const [key, value] of Object.entries(node)) {
+    if (key === "type" || key === "start" || key === "end") continue;
+    if (Array.isArray(value)) value.forEach((item) => walk(item, visitor));
+    else if (value?.type) walk(value, visitor);
+  }
+}
+
+function propertyName(property) {
+  if (!property || property.type !== "Property") return null;
+  if (property.key.type === "Identifier") return property.key.name;
+  if (property.key.type === "Literal") return property.key.value;
+  return null;
+}
+
+function isManagerWorkerOptions(options) {
+  if (options?.type !== "ObjectExpression") return false;
+  const name = options.properties.find((property) => propertyName(property) === "name");
+  const workerData = options.properties.find(
+    (property) => propertyName(property) === "workerData",
+  );
+  return (
+    workerData != null &&
+    name?.value?.type === "MemberExpression" &&
+    name.value.object?.type === "ThisExpression" &&
+    name.value.property?.type === "Identifier" &&
+    name.value.property.name === "id"
+  );
+}
+
+function findManagerWorkerOptions(ast) {
+  const matches = [];
+  walk(ast, (node) => {
+    if (
+      node.type !== "NewExpression" ||
+      node.callee?.type !== "MemberExpression" ||
+      node.callee.property?.type !== "Identifier" ||
+      node.callee.property.name !== "Worker"
+    ) {
+      return;
+    }
+    const options = node.arguments?.[1];
+    if (isManagerWorkerOptions(options)) matches.push(options);
+  });
+  return matches;
+}
+
+function patchSource(source) {
+  let code = source;
+  let upgraded = false;
+  for (const stale of STALE_LIMITS) {
+    if (!code.includes(stale)) continue;
+    code = code.split(stale).join(LIMITS);
+    upgraded = true;
+  }
+
+  let ast;
+  try {
+    ast = parseCode(code);
+  } catch (error) {
+    return { status: "parse-failed", error, source };
+  }
+
+  const matches = findManagerWorkerOptions(ast);
+  if (matches.length !== 1) {
+    return { status: "unexpected-anchor-count", count: matches.length, source };
+  }
+
+  const options = matches[0];
+  const existing = options.properties.find(
+    (property) => propertyName(property) === "resourceLimits",
+  );
+  if (existing) {
+    if (code.slice(existing.start, existing.end) !== LIMITS) {
+      return { status: "unexpected-existing-limits", source };
+    }
+    return upgraded
+      ? { status: "patched", mode: "upgraded", source: code }
+      : { status: "already-patched", source: code };
+  }
+
+  const insertion = `${options.properties.length > 0 ? "," : ""}${LIMITS}`;
+  const insertAt = options.end - 1;
+  const next = code.slice(0, insertAt) + insertion + code.slice(insertAt);
+  try {
+    parseCode(next);
+  } catch (error) {
+    return { status: "parse-failed", error, source };
+  }
+  return { status: "patched", mode: "added", source: next };
 }
 
 function main() {
@@ -77,80 +161,46 @@ function main() {
   }
 
   let patched = 0;
+  let failed = 0;
   for (const bundle of bundles) {
-    let code = fs.readFileSync(bundle.path, "utf-8");
+    const code = fs.readFileSync(bundle.path, "utf-8");
+    const result = patchSource(code);
+    const label = relPath(bundle.path);
 
-    // 旧上限值升级：直接替换常量串
-    let upgraded = false;
-    for (const stale of STALE_LIMITS) {
-      if (code.includes(stale)) {
-        code = code.split(stale).join(LIMITS);
-        upgraded = true;
-      }
+    if (result.status === "already-patched") {
+      console.log(`  [ok] ${label}: already patched`);
+      continue;
     }
-
-    // 幂等：worker 构造点已带最新 resourceLimits
-    if (code.includes(LIMITS)) {
-      if (upgraded) {
-        if (!parseOk(code)) {
-          console.log(
-            `  [x] ${relPath(bundle.path)}: post-upgrade parse failed, aborting`,
-          );
-          continue;
-        }
-        if (isCheck) {
-          console.log(
-            `  [?] ${relPath(bundle.path)}: would upgrade resourceLimits to old-gen 1024MB`,
-          );
-          continue;
-        }
-        fs.writeFileSync(bundle.path, code);
-        console.log(
-          `  [ok] ${relPath(bundle.path)}: resourceLimits upgraded (old-gen 1024MB)`,
-        );
-        patched++;
-      } else {
-        console.log(`  [ok] ${relPath(bundle.path)}: already patched`);
-      }
+    if (result.status === "unexpected-anchor-count") {
+      console.log(`  [x] ${label}: expected exactly 1 worker ctor anchor, found ${result.count}`);
+      failed++;
+      continue;
+    }
+    if (result.status === "unexpected-existing-limits") {
+      console.log(`  [x] ${label}: worker already has unknown resourceLimits`);
+      failed++;
+      continue;
+    }
+    if (result.status === "parse-failed") {
+      console.log(`  [x] ${label}: parse validation failed (${result.error.message})`);
+      failed++;
       continue;
     }
 
-    const matches = code.match(new RegExp(CTOR_RE.source, "g")) || [];
-    if (matches.length !== 1) {
-      console.log(
-        `  [!] ${relPath(bundle.path)}: expected exactly 1 worker ctor anchor, found ${matches.length}, skipping`,
-      );
-      continue;
-    }
-
-    const next = code.replace(
-      CTOR_RE,
-      (_, x, file, data) =>
-        `new ${x}.Worker(${file},{name:this.id,workerData:${data},${LIMITS}})`,
-    );
-
-    if (!parseOk(next)) {
-      console.log(
-        `  [x] ${relPath(bundle.path)}: post-patch parse failed, aborting`,
-      );
-      continue;
-    }
-
+    const action = result.mode === "upgraded" ? "upgrade" : "add";
     if (isCheck) {
-      console.log(
-        `  [?] ${relPath(bundle.path)}: would add worker resourceLimits (old-gen 1024MB)`,
-      );
-      continue;
+      console.log(`  [?] ${label}: would ${action} worker resourceLimits (old-gen 1024MB)`);
+    } else {
+      fs.writeFileSync(bundle.path, result.source);
+      console.log(`  [ok] ${label}: worker resourceLimits ${action === "add" ? "added" : "upgraded"}`);
     }
-
-    fs.writeFileSync(bundle.path, next);
-    console.log(
-      `  [ok] ${relPath(bundle.path)}: worker resourceLimits added (old-gen 1024MB)`,
-    );
     patched++;
   }
 
-  console.log(`  [done] ${patched} file(s) patched`);
+  console.log(`  [done] ${isCheck ? "would patch" : "patched"} ${patched} file(s)`);
+  if (failed > 0) process.exitCode = 1;
 }
 
-main();
+if (require.main === module) main();
+
+module.exports = { LIMITS, findManagerWorkerOptions, patchSource };

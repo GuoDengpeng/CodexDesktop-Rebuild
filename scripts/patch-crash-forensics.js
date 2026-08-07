@@ -4,7 +4,7 @@
  *
  * 背景：已从 minidump 定位到崩溃发生在“主进程(browser/UI 线程)”，类型为
  * ACCESS_VIOLATION 读地址 0x2，RIP 落在 chrome.dll。现有 crashpad dump 为精简版
- * (仅崩溃线程、无符号)，无法进一步定位。本补丁向主进程入口 bootstrap.js 最前端
+ * (仅崩溃线程、无符号)，无法进一步定位。本补丁向 Electron 主进程入口最前端
  * 注入一段“只观测、不改行为”的取证代码，用于在下一次崩溃前后落盘可分析的证据：
  *
  *   1. Chromium 原生日志落盘 (--enable-logging=file / --log-file)，可捕获崩溃前
@@ -16,7 +16,7 @@
  *
  * 全部逻辑包在 try/catch 内，任何失败都不会影响应用本身。
  *
- * 注入方式：把一个“真实 JS 函数”序列化成 IIFE 预置到 bootstrap.js 顶部，
+ * 注入方式：把一个“真实 JS 函数”序列化成 IIFE 预置到主进程入口顶部，
  * 写入前用 acorn 对整份文件做语法校验，解析失败则中止不写。
  *
  * Usage:
@@ -24,8 +24,9 @@
  *   node scripts/patch-crash-forensics.js --check       # 试运行，只报告
  */
 const fs = require("fs");
+const path = require("path");
 const acorn = require("acorn");
-const { locateBundles, relPath } = require("./patch-util");
+const { SRC_DIR, relPath } = require("./patch-util");
 
 const LEGACY_MARKERS = [
   "__CODEX_CRASH_FORENSICS__",
@@ -35,7 +36,7 @@ const MARKER = "__CODEX_CRASH_FORENSICS_V3__";
 
 // ──────────────────────────────────────────────
 //  注入体：以真实函数形式书写，保证语法正确。
-//  运行在 bootstrap.js 的 CommonJS 作用域内 (可用 require)。
+//  运行在 Electron 主入口的 CommonJS 作用域内 (可用 require)。
 //  注意：不得依赖任何压缩后的外部变量名，全部自包含。
 // ──────────────────────────────────────────────
 function __codexForensics() {
@@ -556,6 +557,65 @@ function isElectronBootstrap(code) {
   return found;
 }
 
+function selectMainEntry(files) {
+  let candidates = files.filter((file) => file === "bootstrap.js");
+  if (candidates.length === 0) {
+    const hashed = files.filter((file) => /^main-[^.]+\.js$/.test(file));
+    candidates = hashed.length > 0 ? hashed : files.filter((file) => file === "main.js");
+  }
+  return {
+    count: candidates.length,
+    file: candidates.length === 1 ? candidates[0] : null,
+  };
+}
+
+function resolveDeclaredMain(asarDir) {
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(asarDir, "package.json"), "utf-8"));
+    if (typeof pkg.main !== "string" || pkg.main.length === 0) return null;
+    const relative = pkg.main.replace(/^\.\//, "");
+    if (path.isAbsolute(relative)) return null;
+    const root = path.resolve(asarDir);
+    const candidate = path.resolve(root, relative);
+    if (!candidate.startsWith(root + path.sep) || !fs.statSync(candidate).isFile()) return null;
+    return candidate;
+  } catch {
+    return null;
+  }
+}
+
+function findMainEntries(platform) {
+  const allPlatforms = ["mac-arm64", "mac-x64", "win"];
+  const platforms = platform
+    ? [platform]
+    : allPlatforms.filter((item) =>
+        fs.existsSync(path.join(SRC_DIR, item, "_asar", ".vite", "build")),
+      );
+  const bundles = [];
+  const invalidPlatforms = [];
+
+  for (const currentPlatform of platforms) {
+    const asarDir = path.join(SRC_DIR, currentPlatform, "_asar");
+    const declaredMain = resolveDeclaredMain(asarDir);
+    if (declaredMain) {
+      bundles.push({ platform: currentPlatform, path: declaredMain, declared: true });
+      continue;
+    }
+
+    const buildDir = path.join(asarDir, ".vite", "build");
+    const files = fs.existsSync(buildDir) ? fs.readdirSync(buildDir) : [];
+    const selected = selectMainEntry(files);
+
+    if (selected.file == null) {
+      invalidPlatforms.push({ platform: currentPlatform, count: selected.count });
+      continue;
+    }
+    bundles.push({ platform: currentPlatform, path: path.join(buildDir, selected.file), declared: false });
+  }
+
+  return { bundles, invalidPlatforms };
+}
+
 function main() {
   const args = process.argv.slice(2);
   const isCheck = args.includes("--check");
@@ -563,18 +623,20 @@ function main() {
     ["mac-arm64", "mac-x64", "win"].includes(a),
   );
 
-  const bundles = locateBundles({
-    dir: "build",
-    pattern: /^bootstrap\.js$/,
-    platform,
-  });
+  const { bundles, invalidPlatforms } = findMainEntries(platform);
+
+  for (const item of invalidPlatforms) {
+    console.log(`  [x] ${item.platform}: expected 1 Electron main entry, found ${item.count}`);
+  }
 
   if (bundles.length === 0) {
-    console.log("  [skip] bootstrap.js not found");
+    console.log("  [skip] Electron main entry not found");
+    if (invalidPlatforms.length > 0) process.exitCode = 1;
     return;
   }
 
   let patched = 0;
+  let failed = invalidPlatforms.length;
   for (const bundle of bundles) {
     const code = fs.readFileSync(bundle.path, "utf-8");
 
@@ -587,10 +649,11 @@ function main() {
     }
 
     const { code: baseCode, stripped } = stripKnownInjections(code);
-    if (!isElectronBootstrap(baseCode)) {
+    if (!bundle.declared && !isElectronBootstrap(baseCode)) {
       console.log(
-        `  [!] ${relPath(bundle.path)}: not an electron bootstrap, skipping`,
+        `  [x] ${relPath(bundle.path)}: not an Electron main entry, skipping`,
       );
+      failed++;
       continue;
     }
 
@@ -603,11 +666,13 @@ function main() {
       console.log(
         `  [x] ${relPath(bundle.path)}: post-inject parse failed, aborting (${e.message})`,
       );
+      failed++;
       continue;
     }
 
     if (isCheck) {
       console.log(`  [?] ${relPath(bundle.path)}: would inject forensics (+${INJECT.length} bytes)`);
+      patched++;
       continue;
     }
 
@@ -618,7 +683,15 @@ function main() {
     patched++;
   }
 
-  console.log(`  [done] ${patched} file(s) patched`);
+  console.log(`  [done] ${isCheck ? "would patch" : "patched"} ${patched} file(s)`);
+  if (failed > 0) process.exitCode = 1;
 }
 
-main();
+if (require.main === module) main();
+
+module.exports = {
+  findMainEntries,
+  isElectronBootstrap,
+  resolveDeclaredMain,
+  selectMainEntry,
+};

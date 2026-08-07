@@ -15,8 +15,8 @@
  * 超限文件会走 diff-too-large 分支被跳过/提示，不再全量入内存。
  * 不改 I1 的 64MB 总量上限（j1）、cat-file 的 5MB（k1）、turn-diff 的 1MB。
  *
- * 锚点：`k1=5*1024*1024,A1=32*1024*1024,j1=64*1024*1024`（bundle 内唯一）。
- * 幂等：已是 A1=8*1024*1024 则跳过。写入前 acorn 校验。
+ * 锚点：同一变量声明中连续出现 5MB、32MB、64MB 三个限制值，不依赖压缩变量名。
+ * 幂等：中间值已是 8MB 则跳过。写入前 acorn 校验。
  *
  * Usage:
  *   node scripts/patch-diff-limits.js [platform]   # mac-arm64 | mac-x64 | win | 省略=全部
@@ -26,31 +26,84 @@ const fs = require("fs");
 const acorn = require("acorn");
 const { locateBundles, relPath } = require("./patch-util");
 
-const ANCHOR_OLD = "k1=5*1024*1024,A1=32*1024*1024,j1=64*1024*1024";
-const ANCHOR_NEW = "k1=5*1024*1024,A1=8*1024*1024,j1=64*1024*1024";
+const FIVE_MB = 5 * 1024 * 1024;
+const OLD_DIFF_LIMIT = 32 * 1024 * 1024;
+const NEW_DIFF_LIMIT = 8 * 1024 * 1024;
+const TOTAL_DIFF_LIMIT = 64 * 1024 * 1024;
+const NEW_DIFF_LIMIT_SOURCE = "8*1024*1024";
 
-function parseOk(code) {
+function parseCode(code) {
   try {
-    acorn.parse(code, { ecmaVersion: 2022, sourceType: "script" });
-    return true;
+    return acorn.parse(code, { ecmaVersion: 2022, sourceType: "script" });
   } catch {
-    try {
-      acorn.parse(code, { ecmaVersion: 2022, sourceType: "module" });
-      return true;
-    } catch {
-      return false;
-    }
+    return acorn.parse(code, { ecmaVersion: 2022, sourceType: "module" });
   }
 }
 
-function count(haystack, needle) {
-  let c = 0;
-  let i = 0;
-  while ((i = haystack.indexOf(needle, i)) !== -1) {
-    c++;
-    i += needle.length;
+function staticNumber(node) {
+  if (node?.type === "Literal" && typeof node.value === "number") return node.value;
+  if (node?.type !== "BinaryExpression") return null;
+  const left = staticNumber(node.left);
+  const right = staticNumber(node.right);
+  if (left == null || right == null) return null;
+  if (node.operator === "*") return left * right;
+  if (node.operator === "+") return left + right;
+  return null;
+}
+
+function walk(node, visitor) {
+  if (!node || typeof node !== "object") return;
+  visitor(node);
+  for (const [key, value] of Object.entries(node)) {
+    if (key === "type" || key === "start" || key === "end") continue;
+    if (Array.isArray(value)) value.forEach((item) => walk(item, visitor));
+    else if (value?.type) walk(value, visitor);
   }
-  return c;
+}
+
+function findLimitSequences(ast) {
+  const matches = [];
+  walk(ast, (node) => {
+    if (node.type !== "VariableDeclaration") return;
+    for (let index = 0; index <= node.declarations.length - 3; index++) {
+      const group = node.declarations.slice(index, index + 3);
+      const values = group.map((declaration) => staticNumber(declaration.init));
+      if (
+        values[0] === FIVE_MB &&
+        [OLD_DIFF_LIMIT, NEW_DIFF_LIMIT].includes(values[1]) &&
+        values[2] === TOTAL_DIFF_LIMIT
+      ) {
+        matches.push({ declaration: group[1], value: values[1] });
+      }
+    }
+  });
+  return matches;
+}
+
+function patchSource(source) {
+  let ast;
+  try {
+    ast = parseCode(source);
+  } catch (error) {
+    return { status: "parse-failed", error, source };
+  }
+
+  const matches = findLimitSequences(ast);
+  if (matches.length !== 1) {
+    return { status: "unexpected-anchor-count", count: matches.length, source };
+  }
+  if (matches[0].value === NEW_DIFF_LIMIT) {
+    return { status: "already-patched", source };
+  }
+
+  const init = matches[0].declaration.init;
+  const next = source.slice(0, init.start) + NEW_DIFF_LIMIT_SOURCE + source.slice(init.end);
+  try {
+    parseCode(next);
+  } catch (error) {
+    return { status: "parse-failed", error, source };
+  }
+  return { status: "patched", source: next };
 }
 
 function main() {
@@ -72,46 +125,40 @@ function main() {
   }
 
   let patched = 0;
+  let failed = 0;
   for (const bundle of bundles) {
     const code = fs.readFileSync(bundle.path, "utf-8");
+    const result = patchSource(code);
+    const label = relPath(bundle.path);
 
-    if (code.includes(ANCHOR_NEW)) {
-      console.log(`  [ok] ${relPath(bundle.path)}: already patched`);
+    if (result.status === "already-patched") {
+      console.log(`  [ok] ${label}: already patched`);
       continue;
     }
-
-    const n = count(code, ANCHOR_OLD);
-    if (n !== 1) {
-      console.log(
-        `  [!] ${relPath(bundle.path)}: expected exactly 1 anchor, found ${n}, skipping`,
-      );
+    if (result.status === "unexpected-anchor-count") {
+      console.log(`  [x] ${label}: expected exactly 1 diff limit sequence, found ${result.count}`);
+      failed++;
       continue;
     }
-
-    const next = code.replace(ANCHOR_OLD, ANCHOR_NEW);
-
-    if (!parseOk(next)) {
-      console.log(
-        `  [x] ${relPath(bundle.path)}: post-patch parse failed, aborting`,
-      );
+    if (result.status === "parse-failed") {
+      console.log(`  [x] ${label}: parse validation failed (${result.error.message})`);
+      failed++;
       continue;
     }
 
     if (isCheck) {
-      console.log(
-        `  [?] ${relPath(bundle.path)}: would tighten diff output limit 32MB -> 8MB`,
-      );
-      continue;
+      console.log(`  [?] ${label}: would tighten diff output limit 32MB -> 8MB`);
+    } else {
+      fs.writeFileSync(bundle.path, result.source);
+      console.log(`  [ok] ${label}: diff output limit tightened 32MB -> 8MB`);
     }
-
-    fs.writeFileSync(bundle.path, next);
-    console.log(
-      `  [ok] ${relPath(bundle.path)}: diff output limit tightened 32MB -> 8MB`,
-    );
     patched++;
   }
 
-  console.log(`  [done] ${patched} file(s) patched`);
+  console.log(`  [done] ${isCheck ? "would patch" : "patched"} ${patched} file(s)`);
+  if (failed > 0) process.exitCode = 1;
 }
 
-main();
+if (require.main === module) main();
+
+module.exports = { NEW_DIFF_LIMIT_SOURCE, findLimitSequences, patchSource };

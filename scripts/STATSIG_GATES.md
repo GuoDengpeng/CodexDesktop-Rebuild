@@ -83,7 +83,7 @@ gate 2307253562 → codex_git_commit
 | `patch-statsig-logger.js` | `_setStatus()` | 注入日志，打印所有 gates/configs/layers 值 |
 | `patch-i18n.js` | `qNe()` | 注入 `en-US` 到语言选择器列表 |
 | `patch-devtools.js` | `allowInspectElement` / `devTools` | 属性值 → `!0` |
-| `patch-copyright.js` | About Dialog / setAboutPanelOptions | 替换版权文本 |
+| `patch-copyright.js` | About Dialog / setAboutPanelOptions 或自定义 HTML | 替换版权文本 |
 | `patch-process-polyfill.js` | Windows `process` polyfill | 注入 `process.env`/`process.platform` |
 | `patch-remote-control.js` | gate `4114442250` / `1042620455` | 开启 Connections 入口与 Remote Control 数据加载；保留服务端权限状态判断 |
 
